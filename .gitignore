@@ -1,0 +1,20 @@
+/.idea
+.venv
+temp.txt
+app/logger/*
+!app/logger/logger.py
+!app/resources/.keep
+app/vector_store/*
+.env
+node_modules
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# file
+*.csv
+*.json
+*.joblib
+*.joblib.dat
+*.npy
