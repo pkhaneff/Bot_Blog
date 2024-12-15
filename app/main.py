@@ -68,16 +68,6 @@ def get_application() -> FastAPI:
 
     application.include_router(api_router, prefix=API_PREFIX)
 
-    application.mount(
-        "/static", StaticFiles(directory="app/frontend/static"), name="static"
-    )
-
-    templates = Jinja2Templates(directory="app/frontend/templates")
-
-    @application.get("/", tags=["UI"], response_class=HTMLResponse, deprecated=False)
-    async def read_root(request: Request):
-        return templates.TemplateResponse("index.html", {"request": request})
-
     return application
 
 
