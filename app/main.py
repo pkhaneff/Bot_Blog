@@ -72,10 +72,10 @@ def get_application() -> FastAPI:
 
 
 app = get_application()
-# from app.api.database.create_db import create_db
-# @app.on_event("startup")
-# async def on_startup():
-#     await create_db()
+from app.api.database.create_db import create_db
+@app.on_event("startup")
+async def on_startup():
+    await create_db()
 
 if __name__ == "__main__":
     HOST = os.getenv("APP_HOST")

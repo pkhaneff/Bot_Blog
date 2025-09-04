@@ -1,96 +1,113 @@
 """Chat service"""
 from __future__ import annotations
-
-import os
 from starlette import status
 
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
+# ✅ Dùng wrapper mới
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import OpenSearchVectorSearch
+
 from langchain.prompts import PromptTemplate
-from langchain.memory import ConversationBufferMemory
 from langchain.chains import LLMChain, ConversationalRetrievalChain
 from langchain.chains.question_answering import load_qa_chain
 from langchain.callbacks.manager import AsyncCallbackManager
 from langchain.callbacks import AsyncIteratorCallbackHandler
 
-from app.core.config import MODEL_NAME
-from app.core.constants import OPENAI_API_KEY
 from app.api.responses.base import BaseResponse
 from app.logger.logger import custom_logger
+from app.core.config import MODEL_NAME, OPENAI_API_KEY
+from app.core.config import (
+    OPENSEARCH_URL, OPENSEARCH_USER, OPENSEARCH_PASSWORD, OPENSEARCH_INDEX,
+    OPENSEARCH_USE_SSL, OPENSEARCH_VERIFY_CERTS
+)
+
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIM = 1536
 
 class ConversationChainService:
-    """Create ConversationalRetrievalChain Service"""
-
-    def __init__(self, temperature: float,
-                 memory: ConversationBufferMemory,
+    def __init__(self,
+                 temperature: float,
                  streaming_cb: AsyncIteratorCallbackHandler,
                  conv_cb_manager: AsyncCallbackManager,
                  qa_prompt: PromptTemplate) -> None:
-        """
-        Receive memory, StreamingCallback and ConversationChainCallback
-        """
         self.temperature = temperature
-        self.memory = memory
         self.streaming_cb = streaming_cb
         self.conv_cb_manager = conv_cb_manager
         self.qa_prompt = qa_prompt
-        
-        directory = "app/vector_store"
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-        elif len(os.listdir(directory)) == 0:
-            custom_logger.error("Could not find vector store")
-            raise FileNotFoundError
-        else:
-            vector_index = FAISS.load_local(directory, OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY), allow_dangerous_deserialization=True)
-            self.retriever = vector_index.as_retriever(search_type="similarity", search_kwargs={"k": 3})
 
-    def generate_conv_chain(self, condense_prompt: PromptTemplate) -> ConversationalRetrievalChain:
-        """
-        Generates a conversational retrieval chain
-        """
         try:
+            embeddings = OpenAIEmbeddings(
+                model=EMBED_MODEL,
+                dimensions=EMBED_DIM,
+                api_key=OPENAI_API_KEY,
+            )
+
+            vector_index = OpenSearchVectorSearch(
+                embedding_function=embeddings,
+                index_name=OPENSEARCH_INDEX,
+                opensearch_url=OPENSEARCH_URL,
+                http_auth=(OPENSEARCH_USER, OPENSEARCH_PASSWORD) if OPENSEARCH_USER else None,
+                use_ssl=OPENSEARCH_USE_SSL,
+                verify_certs=OPENSEARCH_VERIFY_CERTS,
+                vector_field="vector",
+                text_field="text"
+            )
+            self.retriever = vector_index.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 3, "vector_field": "vector", "text_field": "text"}
+            )
+        except Exception as e:
+            custom_logger.error(str(e))
+            self.retriever = None
+
+    def generate_conv_chain(self, condense_prompt: PromptTemplate | None):
+        try:
+            if not self.retriever:
+                return None
+
             question_gen_llm = ChatOpenAI(
-                model_name=MODEL_NAME,
-                max_retries=15,
+                model=MODEL_NAME,
                 temperature=self.temperature,
-                # streaming=True,
-                request_timeout=100,
+                max_retries=15,
+                timeout=100,
                 max_tokens=200,
-                openai_api_key=OPENAI_API_KEY
+                api_key=OPENAI_API_KEY,
+                streaming=False,
             )
 
             streaming_llm = ChatOpenAI(
-                model_name=MODEL_NAME,
-                max_retries=15,
+                model=MODEL_NAME,
                 temperature=self.temperature,
-                callbacks=[self.streaming_cb],
-                streaming=False,
-                request_timeout=100,
+                max_retries=15,
+                timeout=100,
                 max_tokens=350,
-                openai_api_key=OPENAI_API_KEY
+                api_key=OPENAI_API_KEY,
+                streaming=True,                  
+                callbacks=[self.streaming_cb],  
             )
 
-            question_gen_chain = LLMChain(llm=question_gen_llm, prompt=condense_prompt)  # , callback_manager=manager)
+            question_gen_chain = None
+            if condense_prompt is not None:
+                question_gen_chain = LLMChain(llm=question_gen_llm, prompt=condense_prompt)
 
             final_qa_chain = load_qa_chain(
-                streaming_llm,
-                prompt=self.qa_prompt
+                llm=streaming_llm,
+                chain_type="stuff",
+                prompt=self.qa_prompt,
+                callback_manager=self.conv_cb_manager
             )
 
             conversation_chain = ConversationalRetrievalChain(
                 retriever=self.retriever,
                 question_generator=question_gen_chain,
                 combine_docs_chain=final_qa_chain,
-                memory=self.memory,
                 return_source_documents=False,
                 max_tokens_limit=2000,
                 callback_manager=self.conv_cb_manager,
             )
-
             return conversation_chain
         except FileNotFoundError:
             custom_logger.error("Could not find vector store")
-            return BaseResponse.error_response(message="Could not find vector store",
-                                               status_code=status.HTTP_404_INTERNAL_SERVER_ERROR)
+            return BaseResponse.error_response(
+                message="Could not find vector store",
+                status_code=status.HTTP_404_NOT_FOUND
+            )

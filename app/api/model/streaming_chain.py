@@ -1,5 +1,5 @@
 """
-    StreamingChat using LangChain and ChatOpenAI
+    StreamingChat using LangChain and ChatOpenAI (no in-RAM memory)
 """
 from __future__ import annotations
 from collections.abc import AsyncGenerator
@@ -7,83 +7,72 @@ from starlette import status
 
 from langchain.callbacks.manager import AsyncCallbackManager
 from langchain.callbacks import AsyncIteratorCallbackHandler
-from langchain.memory import ConversationBufferWindowMemory
 from langchain.chains import ConversationalRetrievalChain
 
 from app.core.condense_prompt import _template
 from app.api.services.custom_prompt_service import CustomPromptService
+from app.api.responses.base import BaseResponse
+from app.logger.logger import custom_logger
+
 
 class StreamingConversationRetrievalChain:
     """
-    Class for handling streaming conversation chains.
-    It creates and stores memory for each conversation,
-    and generates responses using the ChatOpenAI model from LangChain.
+    Streaming, không dùng ConversationBufferWindowMemory.
+    Lịch sử chat được truyền qua tham số `chat_history` (nạp từ DB).
+    Prompt lấy từ DB, không đọc file.
     """
 
-    def __init__(self, streaming_cb: AsyncIteratorCallbackHandler,
-                 conversation_id: str = "24",
-                 temperature: float = 0.0):
-        self.memories = {}
-        self.temperature = temperature
+    def __init__(self,
+                 conversation_id: str,
+                 streaming_cb: AsyncIteratorCallbackHandler,
+                 conv_cb_manager: AsyncCallbackManager,
+                 qa_prompt) -> None:
         self.conversation_id = conversation_id
-
-        # Create Callback Handler
         self.streaming_cb = streaming_cb
-        self.conv_cb_manager = AsyncCallbackManager([streaming_cb])
-
-        # Create memory for each conversation_id
-        self.memory = self.memories.get(self.conversation_id)
-        if self.memory is None:
-            self.memory = ConversationBufferWindowMemory(memory_key="chat_history", 
-                                                         return_messages=True, 
-                                                         output_key="answer",
-                                                         k=4)
-                                                   
-            self.memories[self.conversation_id] = self.memory
-
-        # Load prompt
-        with open(r"app/core/chat_prompt.txt", "r", encoding="utf-8") as file:
-            template = file.read()
-        self.chat_template = f"""{template}"""
-        custom_chat_prompt = CustomPromptService(self.chat_template, _template)
-        self.chat_prompt_template = custom_chat_prompt.custom_prompt()
-        self.condense_question_prompt = custom_chat_prompt.custom_condense_prompt()
-
+        self.conv_cb_manager = conv_cb_manager
+        self.qa_prompt = qa_prompt
         self.output = None
 
+    def _build_prompts(self, current_template: str):
+        cps = CustomPromptService(current_template, _template)
+        chat_prompt_template = cps.custom_prompt()
+        condense_question_prompt = cps.custom_condense_prompt()
+        return chat_prompt_template, condense_question_prompt
+
     async def generate_response(
-        self, message: str, 
+        self,
+        message: str,
         chat_template: str,
-        conv_chain_service: ConversationChainService,
-        conversation_chain: ConversationalRetrievalChain
+        conv_chain_service,
+        conversation_chain: ConversationalRetrievalChain,
+        chat_history=None
     ) -> AsyncGenerator[str, None]:
-        """
-        Asynchronous function to generate a response for a conversation.
-        It creates a new conversation chain for each message and uses a
-        callback handler to stream responses as they're generated.
-        :param message: The message from the user.
-        :param chat_template: Prompt template for system chat.
-        :param conv_chain_service: Conversation Chain Service.
-        :param conversation_chain: ConversationalRetrievalChain.
-        """
-        # Load prompt from chat_prompt.txt
-        with open(r"app/core/chat_prompt.txt", "r", encoding="utf-8") as file:
-            template = file.read()
-        current_template = f"""{template}"""
+        try:
+            if chat_template == getattr(conv_chain_service, "qa_prompt_text", None):
+                if chat_history is not None:
+                    output = await conversation_chain.acall({"question": message, "chat_history": chat_history})
+                else:
+                    output = await conversation_chain.acall({"question": message})
+                self.output = output["answer"]
+                yield self.output
+                return
 
-        # Check current prompt with initial prompt
-        if current_template == chat_template:
-            output = await conversation_chain.acall({"question": message})
-            self.output = output['answer']
-        else:
-            custom_chat_prompt = CustomPromptService(current_template, _template)
-            new_chat_prompt_template = custom_chat_prompt.custom_prompt()  
+            new_chat_prompt_template, condense_prompt = self._build_prompts(chat_template)
             conv_chain_service.qa_prompt = new_chat_prompt_template
-
-            conversation_chain = conv_chain_service.generate_conv_chain(self.condense_question_prompt)
+            conv_chain_service.qa_prompt_text = chat_template
+            conversation_chain = conv_chain_service.generate_conv_chain(condense_prompt)
             if conversation_chain is None:
-                answer = "Sorry! I don't have any information about this question. Please provide me document about this."
-                self.output = answer
+                self.output = "Sorry! I don't have any information about this question. Please provide me document about this."
+                yield self.output
+                return
+
+            if chat_history is not None:
+                output = await conversation_chain.acall({"question": message, "chat_history": chat_history})
             else:
                 output = await conversation_chain.acall({"question": message})
-                self.output = output['answer']
+            self.output = output["answer"]
+            yield self.output
+
+        except Exception as e:
+            custom_logger.error(str(e))
+            yield BaseResponse.error_response(message=str(e), status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
