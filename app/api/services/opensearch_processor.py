@@ -1,12 +1,12 @@
 from __future__ import annotations
-from typing import List, Optional
+from typing import Dict, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from opensearchpy import OpenSearch                      # NEW
+from opensearchpy import OpenSearch
 from langchain_community.vectorstores import OpenSearchVectorSearch
 from langchain_openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document            # CHANGED
+from langchain_core.documents import Document
 
 from app.api.database.dao.imported_document_dao import ImportedDocumentDAO
 from app.api.responses.base import BaseResponse
@@ -18,26 +18,93 @@ from app.core.config import (
     OPENSEARCH_USE_SSL, OPENSEARCH_VERIFY_CERTS
 )
 
-EMBED_MODEL = "text-embedding-3-small"   # dùng model embedding, KHÔNG dùng gpt-3-turbo
-EMBED_DIM   = 1536                       # phải khớp với mapping
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIM   = 1536
+
+
+def default_index_body(
+    *,
+    vector_field: str = "vector",
+    text_field: str = "text",
+    extra_settings: Optional[Dict] = None,
+    extra_mappings: Optional[Dict] = None,
+) -> Dict:
+    """Tạo body settings/mappings mặc định, có thể bổ sung/ghi đè theo từng index."""
+    body = {
+        "settings": {
+            "index": {
+                "knn": True,
+            }
+        },
+        "mappings": {
+            "properties": {
+                vector_field: {
+                    "type": "knn_vector",
+                    "dimension": EMBED_DIM,
+                    "method": {
+                        "name": "hnsw",
+                        "engine": "lucene",
+                        "space_type": "cosinesimil",
+                        "parameters": {"ef_construction": 128, "m": 16}
+                    }
+                },
+                text_field: {"type": "text"},
+                "doc_id": {"type": "keyword"},
+                "file_name": {"type": "keyword"},
+                "chunk": {"type": "integer"},
+            }
+        },
+    }
+    if extra_settings:
+        body["settings"].update(extra_settings)
+    if extra_mappings:
+        body["mappings"]["properties"].update(extra_mappings)
+    return body
+
 
 class OpenSearchProcessor:
-    def __init__(self, db: AsyncSession, index_name: Optional[str] = None):
+    def __init__(
+        self,
+        db: AsyncSession,
+        index_name: Optional[str] = None,
+        *,
+        # Cho phép cấu hình theo từng index
+        vector_field: str = "vector",
+        text_field: str = "text",
+        index_body: Optional[Dict] = None,
+        create_if_missing: bool = True,
+    ):
         self.db = db
         self.dao = ImportedDocumentDAO()
         self.index_name = index_name or OPENSEARCH_INDEX
+        self.vector_field = vector_field
+        self.text_field = text_field
 
-        # 1) Đảm bảo index tồn tại với mapping đúng
-        self._ensure_index()
+        # Khởi tạo client 1 lần để tái sử dụng
+        self.client = OpenSearch(
+            hosts=[OPENSEARCH_URL],
+            http_auth=(OPENSEARCH_USER, OPENSEARCH_PASSWORD) if OPENSEARCH_USER else None,
+            use_ssl=OPENSEARCH_USE_SSL,
+            verify_certs=OPENSEARCH_VERIFY_CERTS,
+        )
 
-        # 2) Embedding chuẩn (model + dimension)
+        # Chỉ tạo index nếu chưa có và cho phép tạo
+        if create_if_missing:
+            self._ensure_index(
+                index_name=self.index_name,
+                body=index_body
+                or default_index_body(
+                    vector_field=self.vector_field,
+                    text_field=self.text_field,
+                ),
+            )
+
         self.emb = OpenAIEmbeddings(
             model=EMBED_MODEL,
             dimensions=EMBED_DIM,
             api_key=OPENAI_API_KEY,
         )
 
-        # 3) Khởi tạo vector store client
         self.vs = OpenSearchVectorSearch(
             embedding_function=self.emb,
             index_name=self.index_name,
@@ -45,8 +112,8 @@ class OpenSearchProcessor:
             http_auth=(OPENSEARCH_USER, OPENSEARCH_PASSWORD) if OPENSEARCH_USER else None,
             use_ssl=OPENSEARCH_USE_SSL,
             verify_certs=OPENSEARCH_VERIFY_CERTS,
-            vector_field="vector",
-            text_field="text",
+            vector_field=self.vector_field,
+            text_field=self.text_field,
         )
 
         self.splitter = RecursiveCharacterTextSplitter(
@@ -54,31 +121,17 @@ class OpenSearchProcessor:
             chunk_overlap=CHUNK_OVERLAP,
         )
 
-    def _ensure_index(self) -> None:
-        client = OpenSearch(
-            hosts=[OPENSEARCH_URL],
-            http_auth=(OPENSEARCH_USER, OPENSEARCH_PASSWORD) if OPENSEARCH_USER else None,
-            use_ssl=OPENSEARCH_USE_SSL,
-            verify_certs=OPENSEARCH_VERIFY_CERTS,
-        )
-        if not client.indices.exists(self.index_name):
-            body = {
-                "settings": {"index": {"knn": True}},
-                "mappings": {
-                    "properties": {
-                        "vector": {
-                            "type": "knn_vector",
-                            "dimension": EMBED_DIM,
-                            "method": {"name": "hnsw", "engine": "nmslib", "space_type": "cosinesimil"},
-                        },
-                        "text": {"type": "text"},
-                        "doc_id": {"type": "keyword"},
-                        "file_name": {"type": "keyword"},
-                        "chunk": {"type": "integer"},
-                    }
-                },
-            }
-            client.indices.create(index=self.index_name, body=body)
+    def _ensure_index(self, *, index_name: str, body: Dict) -> None:
+        """Tạo index với cấu hình RIÊNG nếu chưa tồn tại; nếu đã có thì dùng luôn."""
+        try:
+            exists = self.client.indices.exists(index=index_name)
+            if not exists:
+                self.client.indices.create(index=index_name, body=body)
+        except Exception as e:
+            # Nếu race-condition khi nhiều worker cùng tạo, bỏ qua lỗi 'resource_already_exists_exception'
+            msg = str(e)
+            if "resource_already_exists_exception" not in msg:
+                raise
 
     async def process_unprocessed(self, limit: Optional[int] = None):
         try:
@@ -88,7 +141,6 @@ class OpenSearchProcessor:
 
             indexed_ids: List[str] = []
             for d in docs:
-                # Chunking
                 chunks = self.splitter.create_documents([d.content])
                 doc_objs: List[Document] = []
                 for i, ch in enumerate(chunks):
@@ -99,8 +151,8 @@ class OpenSearchProcessor:
                         )
                     )
 
-                # Index vào OpenSearch (đồng bộ; OK trong async, nhưng sẽ block)
-                self.vs.add_documents(doc_objs, vector_field="vector", text_field="text")
+                # Đảm bảo trường phải khớp với mapping của index hiện tại
+                self.vs.add_documents(doc_objs, vector_field=self.vector_field, text_field=self.text_field)
                 indexed_ids.append(d.id)
                 await self.dao.mark_processed(self.db, d.id)
 

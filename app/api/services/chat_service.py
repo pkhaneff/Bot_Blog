@@ -49,7 +49,9 @@ class ConversationChainService:
                 use_ssl=OPENSEARCH_USE_SSL,
                 verify_certs=OPENSEARCH_VERIFY_CERTS,
                 vector_field="vector",
-                text_field="text"
+                text_field="text",
+                engine="lucene",
+                space_type="cosinesimil",
             )
             self.retriever = vector_index.as_retriever(
                 search_type="similarity",

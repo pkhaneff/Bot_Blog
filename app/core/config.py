@@ -44,7 +44,7 @@ LOCAL_HOST: str = config("LOCAL_HOST", default="127.0.0.1")
 OPENSEARCH_URL: str = config("OPENSEARCH_URL", default="http://127.0.0.1:9200")
 OPENSEARCH_USER: str = config("OPENSEARCH_USER", default="")
 OPENSEARCH_PASSWORD: str = config("OPENSEARCH_PASSWORD", default="")
-OPENSEARCH_INDEX: str = config("OPENSEARCH_INDEX", default="chatbot_docs")
+OPENSEARCH_INDEX: str = config("OPENSEARCH_INDEX", default="chatbot")
 OPENSEARCH_USE_SSL: bool = config("OPENSEARCH_USE_SSL", cast=bool, default=False)
 OPENSEARCH_VERIFY_CERTS: bool = config("OPENSEARCH_VERIFY_CERTS", cast=bool, default=False)
 
